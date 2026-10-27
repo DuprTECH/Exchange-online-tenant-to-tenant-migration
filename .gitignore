@@ -1,0 +1,6 @@
+# Local configuration (tenant/app IDs, encrypted secrets) and migration state
+migration.config.json
+*.config.json
+mapping.csv
+work/
+*.pfx

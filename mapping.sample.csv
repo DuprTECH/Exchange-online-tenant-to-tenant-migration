@@ -1,0 +1,4 @@
+SourceMailbox,TargetMailbox,SourceArchive,TargetArchive,TargetRootFolder
+jan.novak@contoso.com,jan.novak@fabrikam.com,false,false,
+eva.mala@contoso.com,eva.mala@fabrikam.com,true,true,
+info@contoso.com,office@fabrikam.com,false,false,Migrated - info
