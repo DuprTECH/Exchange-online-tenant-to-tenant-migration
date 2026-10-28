@@ -118,6 +118,41 @@ function Start-Migration {
     finally { $runLock.Dispose() }
 }
 
+# Live status is drawn as plain text at a fixed place in the console instead of Write-Progress:
+# on some PowerShell 7.6 consoles every Write-Progress refresh beeps. Plain text without escape sequences cannot.
+function Format-Bar {
+    param([double]$Percent, [int]$Width = 20)
+    $n = [int][math]::Round([math]::Max(0, [math]::Min(100, $Percent)) * $Width / 100)
+    '[' + ('#' * $n) + ('-' * ($Width - $n)) + ']'
+}
+
+function Show-RunStatus {
+    param([Parameter(Mandatory)][hashtable]$View, [string[]]$Lines)
+    $w = [math]::Max(20, [Console]::BufferWidth - 1)
+    if ($View.Top -ge 0) { [Console]::SetCursorPosition(0, $View.Top) }
+    $count = [math]::Max($Lines.Count, $View.Lines)
+    $sb = [Text.StringBuilder]::new()
+    for ($i = 0; $i -lt $count; $i++) {
+        $t = if ($i -lt $Lines.Count) { $Lines[$i] -replace '[\x00-\x1F\x7F]', ' ' } else { '' }
+        if ($t.Length -gt $w) { $t = $t.Substring(0, $w) }
+        [void]$sb.Append($t.PadRight($w)).Append("`n")
+    }
+    [Console]::Write($sb.ToString())
+    $View.Top = [Console]::CursorTop - $count
+    $View.Lines = $count
+}
+
+function Clear-RunStatus {
+    param([Parameter(Mandatory)][hashtable]$View)
+    if ($View.Top -lt 0) { return }
+    $w = [math]::Max(20, [Console]::BufferWidth - 1)
+    [Console]::SetCursorPosition(0, $View.Top)
+    [Console]::Write(((' ' * $w) + "`n") * $View.Lines)
+    [Console]::SetCursorPosition(0, $View.Top)
+    $View.Top = -1
+    $View.Lines = 0
+}
+
 function Invoke-MigrationRun {
     param($Config, [string]$JobDir, [string]$ModulePath, [switch]$Rescan, [switch]$IncludeCompleted)
     $jobDir = $JobDir
@@ -134,16 +169,15 @@ function Invoke-MigrationRun {
 
     $parallel = [math]::Max(1, [int]$Config.Parallelism)
     $running = @{}         # pair key -> @{ Job; Pair; Id }
-    $progressIds = @{}     # pair key -> Write-Progress id
-    $nextId = 1
     $started = Get-Date
     $initialDone = ($pairs | ForEach-Object { [long]((Get-PairProgress $Config $_).ItemsDone ?? 0) } | Measure-Object -Sum).Sum
     $stopNotified = $false
 
-    # The OSC 9;4 taskbar progress sequence ends with BEL; terminals that don't support it beep on every refresh.
-    $oscProgress = $PSStyle.Progress.PSObject.Properties['UseOSCIndicator']
-    $oscWasOn = $oscProgress -and $PSStyle.Progress.UseOSCIndicator
-    if ($oscWasOn) { $PSStyle.Progress.UseOSCIndicator = $false }
+    $view = @{ Top = -1; Lines = 0 }
+    $interactive = -not [Console]::IsOutputRedirected
+    $lastPlainStatus = [datetime]::MinValue
+    $cursorWasVisible = $null
+    if ($interactive -and $IsWindows) { try { $cursorWasVisible = [Console]::CursorVisible; [Console]::CursorVisible = $false } catch { } }
 
     Write-Host "Migrating $($queue.Count) mailbox pair(s), $parallel in parallel. Press Q to stop gracefully (state is kept, run again to resume)." -ForegroundColor Cyan
     Write-JobLog $jobDir "Run started: $($queue.Count) pair(s), parallel $parallel, rescan $([bool]$Rescan)"
@@ -160,7 +194,6 @@ function Invoke-MigrationRun {
                     Import-Module $m -Force
                     Invoke-PairMigration -Config $c -Pair $pair -Rescan:$r
                 }
-                $progressIds[$key] = $nextId++
                 $running[$key] = @{ Job = $job; Pair = $p }
             }
             if ((Test-StopRequested $Config) -and $queue.Count -gt 0) { $queue.Clear() }
@@ -175,6 +208,7 @@ function Invoke-MigrationRun {
             catch { }
             if ((Test-StopRequested $Config) -and -not $stopNotified) {
                 $stopNotified = $true
+                if ($interactive) { Clear-RunStatus $view }
                 Write-Host 'Stop requested - finishing current batches...' -ForegroundColor Yellow
             }
 
@@ -186,9 +220,10 @@ function Invoke-MigrationRun {
             $rate = if ($elapsed.TotalMinutes -gt 0.2) { ($sumDone - $initialDone) / $elapsed.TotalMinutes } else { 0 }
             $pct = if ($sumTotal -gt 0) { [math]::Min(100, 100 * $sumDone / $sumTotal) } else { 0 }
             $eta = if ($rate -gt 0 -and $sumTotal -gt $sumDone) { [TimeSpan]::FromMinutes(($sumTotal - $sumDone) / $rate).ToString('d\.hh\:mm\:ss') } else { '-' }
-            Write-Progress -Id 0 -Activity "Mailbox migration '$($Config.JobName)'" `
-                -Status ("{0:N0} / {1:N0} items ({2:N1} %) | {3:N0} items/min | ETA {4} | running {5}, queued {6}" -f $sumDone, $sumTotal, $pct, $rate, $eta, $running.Count, $queue.Count) `
-                -PercentComplete $pct
+            $summary = "{0:N0} / {1:N0} items ({2:N1} %) | {3:N0} items/min | ETA {4} | running {5}, queued {6}" -f $sumDone, $sumTotal, $pct, $rate, $eta, $running.Count, $queue.Count
+            $lines = [System.Collections.Generic.List[string]]::new()
+            $lines.Add("Mailbox migration '$($Config.JobName)'  $(Format-Bar $pct)  Q = stop")
+            $lines.Add("  $summary")
 
             foreach ($key in @($running.Keys)) {
                 $r = $running[$key]
@@ -198,19 +233,29 @@ function Invoke-MigrationRun {
                     "{0} | {1:N0}/{2:N0} | folders {3}/{4} | {5:N1} MB | failed {6} | {7}" -f $pr.Status, $pr.ItemsDone, $pr.ItemsTotal,
                         $pr.FoldersDone, $pr.FoldersTotal, ($pr.BytesThisRun / 1MB), $pr.ItemsFailedThisRun, $pr.CurrentFolder
                 } else { 'Starting' }
-                Write-Progress -Id $progressIds[$key] -ParentId 0 -Activity "$($r.Pair.SourceMailbox) -> $($r.Pair.TargetMailbox)" -Status $status -PercentComplete $ppct
 
                 if ($r.Job.State -in 'Completed', 'Failed', 'Stopped') {
                     $out = Receive-Job $r.Job -ErrorAction SilentlyContinue -ErrorVariable jobErr | Select-Object -Last 1
                     foreach ($e in $jobErr) { Write-JobLog $jobDir "[$key] job error: $e" }
                     Remove-Job $r.Job -Force
-                    Write-Progress -Id $progressIds[$key] -ParentId 0 -Activity $key -Completed
                     $running.Remove($key)
+                    if ($interactive) { Clear-RunStatus $view }
                     $final = $out.Status ?? $pr.Status
                     $color = switch ($final) { 'Completed' { 'Green' } 'CompletedWithErrors' { 'Yellow' } 'Stopped' { 'Yellow' } default { 'Red' } }
-                    Write-Host ("[{0}] {1} -> {2}: {3} {4}" -f (Get-Date -Format 'HH:mm:ss'), $r.Pair.SourceMailbox, $r.Pair.TargetMailbox, $final, $out.Message) -ForegroundColor $color
+                    Write-Host ("[{0}] {1} -> {2}: {3} {4}" -f (Get-Date -Format 'HH:mm:ss'), $r.Pair.SourceMailbox, $r.Pair.TargetMailbox, $final, ($out.Message -replace '[\x00-\x1F\x7F]', ' ')) -ForegroundColor $color
                     Write-JobLog $jobDir "$key finished: $final $($out.Message)"
+                    continue
                 }
+                $lines.Add("  $($r.Pair.SourceMailbox) -> $($r.Pair.TargetMailbox)  $(Format-Bar $ppct) {0,5:N1} %" -f $ppct)
+                $lines.Add("    $status")
+            }
+            if ($interactive) {
+                Show-RunStatus $view $lines
+            }
+            elseif (((Get-Date) - $lastPlainStatus).TotalSeconds -ge 60) {
+                # Redirected output (Task Scheduler, logs): one summary line per minute.
+                Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $summary)
+                $lastPlainStatus = Get-Date
             }
             Start-Sleep -Milliseconds 1000
         }
@@ -218,6 +263,7 @@ function Invoke-MigrationRun {
     }
     finally {
         # Ctrl+C or an error: workers are thread jobs that would keep running in the background - stop them cleanly.
+        if ($interactive) { Clear-RunStatus $view }
         if (-not $finished -and $running.Count -gt 0) {
             Write-Host 'Interrupted - stopping running migrations (they finish the current batch)...' -ForegroundColor Yellow
             Request-MigrationStop $Config
@@ -227,8 +273,7 @@ function Invoke-MigrationRun {
             $jobs | Remove-Job -Force -ErrorAction SilentlyContinue
             Write-JobLog $jobDir 'Run interrupted - workers stopped'
         }
-        Write-Progress -Id 0 -Activity 'Mailbox migration' -Completed
-        if ($oscWasOn) { $PSStyle.Progress.UseOSCIndicator = $true }
+        if ($null -ne $cursorWasVisible) { try { [Console]::CursorVisible = $cursorWasVisible } catch { } }
     }
     Write-JobLog $jobDir 'Run finished'
     Get-MigrationStatus $Config | Format-Table Source, Target, Status, Percent, ItemsDone, ItemsTotal, Folders, FailedTotal -AutoSize
@@ -261,7 +306,7 @@ function Test-MigrationReadiness {
     $i = 0
     $rows = foreach ($p in $pairs) {
         $i++
-        Write-Progress -Activity 'Pre-flight check' -Status $p.SourceMailbox -PercentComplete (100 * $i / $pairs.Count)
+        Write-Host "Checking $i/$($pairs.Count): $($p.SourceMailbox) -> $($p.TargetMailbox)" -ForegroundColor DarkGray
         $row = [ordered]@{ Source = $p.SourceMailbox; Target = $p.TargetMailbox; SourceOK = $false; TargetOK = $false; Folders = 0; Items = 0; Error = '' }
         try {
             $sm = Get-MailboxId -Context $src -User $p.SourceMailbox -Archive:$p.SourceArchive
@@ -279,6 +324,5 @@ function Test-MigrationReadiness {
         catch { $row.Error = $_.Exception.Message }
         [pscustomobject]$row
     }
-    Write-Progress -Activity 'Pre-flight check' -Completed
     $rows
 }

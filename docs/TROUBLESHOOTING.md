@@ -53,6 +53,10 @@ To clean up a mailbox that already has duplicates:
 
 Another process holds `run.lock`. Stop the migration there (`Q`) or close that window. If no other window exists, close all `pwsh` processes; the lock is released when the process holding it ends.
 
+## The console beeps on every progress refresh
+
+Older versions used `Write-Progress`, and on some PowerShell 7.6 consoles every refresh beeped, even with `$PSStyle.Progress.UseOSCIndicator` turned off. Current versions draw the status as plain text, which cannot beep. If you still hear a sound at irregular intervals, it is probably Outlook announcing the imported items in a target mailbox that is open in Outlook.
+
 ## Items in `failed.log`
 
 | Error | Meaning |
