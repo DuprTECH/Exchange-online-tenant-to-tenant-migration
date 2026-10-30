@@ -30,13 +30,29 @@ function Write-JsonAtomic {
     param([string]$Path, $Object)
     $tmp = "$Path.tmp"
     $Object | ConvertTo-Json -Depth 20 | Set-Content -Path $tmp -Encoding utf8
-    Move-Item -Path $tmp -Destination $Path -Force
+    # The orchestrator reads these files every second; retry if the replace collides with a reader.
+    for ($i = 1; ; $i++) {
+        try { [IO.File]::Move($tmp, $Path, $true); return }
+        catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+            if ($i -ge 20) { throw }
+            Start-Sleep -Milliseconds 50
+        }
+    }
 }
 
 function Read-JsonFile {
     param([string]$Path)
-    if (-not (Test-Path $Path)) { return $null }
-    try { Get-Content -Path $Path -Raw | ConvertFrom-Json -Depth 20 } catch { $null }
+    # Opened with FileShare.Delete so a writer can replace the file while we read it.
+    for ($i = 1; $i -le 5; $i++) {
+        try {
+            $fs = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete)
+            try { $text = [IO.StreamReader]::new($fs).ReadToEnd() } finally { $fs.Dispose() }
+            return $text | ConvertFrom-Json -Depth 20
+        }
+        catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] { return $null }
+        catch { Start-Sleep -Milliseconds 50 }
+    }
+    $null
 }
 
 function Read-DoneSet {
